@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TUZAKI</title>
+<style>
+*{box-sizing:border-box}
+html,body{min-height:100%;margin:0}
+body{background:#0b0b10;color:#f2f2f5;font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:24px;text-align:center}
+h1{margin:0;letter-spacing:.35em;font-size:1.1rem;color:#8b8b99}
+.room{width:min(900px,100%);background:#111118;border:1px solid #2a2a38;border-radius:18px;padding:18px}
+.room-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;color:#c5c5ce}
+.room-head b{color:#f2f2f5;font-size:1.1rem}
+.tiles{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.tile{min-height:74px;padding:12px;border:2px solid #30303c;border-radius:12px;background:#191922;display:flex;align-items:center;justify-content:center;overflow-wrap:anywhere;font-weight:650;transition:border-color .15s,box-shadow .15s}
+.tile.me{border-color:#e5322d}
+.tile.spk{border-color:#2ecc71;box-shadow:0 0 12px #2ecc7188}
+.tile.empty{color:#666674;font-weight:400;border-style:dashed;border-width:1px}
+.controls{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+button{background:#e5322d;color:#fff;border:0;border-radius:12px;padding:13px 28px;font-size:1rem;font-weight:700;cursor:pointer}
+button:active{transform:scale(.97)}
+button:disabled{opacity:.55;cursor:wait}
+#mic{background:#33333e}
+#mic.on{background:#2ecc71}
+#msg{min-height:1.4em;font-weight:600}
+.busy{color:#ffb020}.ok{color:#2ecc71}
+@media(max-width:620px){.tiles{grid-template-columns:repeat(2,minmax(0,1fr))}.room{padding:14px}.tile{min-height:62px}}
+
+#name-overlay{position:fixed;inset:0;background:rgba(11,11,16,.94);backdrop-filter:blur(12px);display:flex;align-items:center;justify-content:center;z-index:999}
+.name-box{background:#111118;border:1px solid #2e2e3e;border-radius:22px;padding:40px 36px;width:min(380px,90vw);text-align:center;box-shadow:0 24px 60px rgba(0,0,0,.6)}
+.name-box h2{margin:0 0 6px;font-size:1.7rem;font-weight:800;letter-spacing:.12em}
+.name-box p{margin:0 0 28px;color:#7a7a8a;font-size:.95rem}
+.name-box input{width:100%;background:#191922;border:1.5px solid #30303c;border-radius:12px;color:#f2f2f5;font-size:1.05rem;padding:13px 16px;outline:none;font-family:inherit}
+.name-box input:focus{border-color:#e5322d}
+#name-err{min-height:1.2em;color:#ffb020;font-size:.88rem;margin:8px 0 0}
+.btn-enter{margin-top:20px;width:100%;padding:14px}
+</style>
+</head>
+<body>
+
+<div id="name-overlay" role="dialog" aria-modal="true" aria-label="Nom kiritish">
+  <div class="name-box">
+    <h2>TUZAKI</h2>
+    <p>Davom etish uchun nomingizni kiriting</p>
+    <input id="name-input" type="text" maxlength="24" placeholder="Nomingiz..." autocomplete="off" spellcheck="false">
+    <div id="name-err"></div>
+    <button class="btn-enter" id="name-btn">Kirish &rarr;</button>
+  </div>
+</div>
+
+<h1>TUZAKI</h1>
+<section class="room" aria-label="Gaplashish xonasi">
+  <div class="room-head">
+    <span>Gaplashish xonasi</span>
+    <span><b id="count">0</b> / <span id="max">10</span> kishi</span>
+  </div>
+  <div id="members" class="tiles" aria-live="polite"></div>
+</section>
+<div class="controls">
+  <button id="go">Gaplashish</button>
+  <button id="mic" hidden>Mikrofonni yoqish</button>
+</div>
+<div id="msg" aria-live="polite"></div>
+
+<script>
+var $ = function (i) { return document.getElementById(i); };
+var OUT_RATE = 16000;
+
+var sessionName = '';          // faqat shu sahifa ochiq turguncha; saqlanmaydi
+var wantInside = false;        // xonada bo'lishni xohlaymiz (uzilib qolsa qayta kiramiz)
+var ws, S = { count: 0, maxParticipants: 10, members: [], inside: false, participantId: null };
+var ac = null, nextT = {}, spk = {};
+var mic = null, micCtx = null, micProcessor = null, micEnabled = false, hang = 0, pos = 0;
+
+function say(t, c) { $('msg').textContent = t; $('msg').className = c || ''; }
+function tx(m) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(m)); return true; } return false; }
+function ensureAudio() {
+  if (!ac) ac = new (window.AudioContext || window.webkitAudioContext)();
+  if (ac.state === 'suspended') ac.resume();
+}
+
+/* ---------- Nom oynasi ---------- */
+function showNameOverlay() {
+  $('name-overlay').style.display = 'flex';
+  $('name-input').value = '';
+  $('name-err').textContent = '';
+  setTimeout(function () { $('name-input').focus(); }, 80);
+}
+function confirmName() {
+  var val = $('name-input').value.trim().slice(0, 24);
+  if (!val) { $('name-err').textContent = 'Iltimos, nomingizni kiriting.'; return; }
+  sessionName = val;
+  $('name-overlay').style.display = 'none';
+  requestJoin();
+}
+$('name-btn').onclick = confirmName;
+$('name-input').onkeydown = function (e) { if (e.key === 'Enter') confirmName(); };
+showNameOverlay();
+
+/* ---------- Xonaga kirish ---------- */
+function requestJoin() {
+  wantInside = true;
+  ensureAudio();
+  if (!tx({ type: 'join', name: sessionName })) say('Server bilan aloqa yo\u02BBq. Ulanmoqda...', 'busy');
+}
+$('go').onclick = function () {
+  if (S.inside || wantInside) {
+    wantInside = false;
+    tx({ type: 'leave' });
+    stopMic();
+    say('Siz xonadan chiqdingiz.');
+    return;
+  }
+  if (!sessionName) { showNameOverlay(); return; }
+  requestJoin();
+};
+
+/* ---------- Ko'rinish ---------- */
+function render() {
+  $('count').textContent = S.count;
+  $('max').textContent = S.maxParticipants;
+  $('go').textContent = S.inside ? 'Chiqish' : 'Gaplashish';
+  $('mic').hidden = !S.inside;
+  $('mic').textContent = micEnabled ? 'Mikrofonni o\u02BBchirish' : 'Mikrofonni yoqish';
+  $('mic').classList.toggle('on', micEnabled);
+  var list = $('members');
+  list.textContent = '';
+  S.members.forEach(function (m) {
+    var tile = document.createElement('div');
+    var mine = m.id === S.participantId;
+    tile.className = 'tile' + (mine ? ' me' : '');
+    tile.setAttribute('data-id', m.id);
+    tile.textContent = m.name + (mine ? ' (siz)' : '');
+    list.appendChild(tile);
+  });
+  for (var i = S.members.length; i < 4; i++) {
+    var empty = document.createElement('div');
+    empty.className = 'tile empty';
+    empty.textContent = 'Bo\u02BBsh joy';
+    list.appendChild(empty);
+  }
+}
+setInterval(function () {
+  var tiles = document.querySelectorAll('.tile[data-id]'), now = Date.now();
+  for (var i = 0; i < tiles.length; i++) {
+    var id = +tiles[i].getAttribute('data-id');
+    tiles[i].classList.toggle('spk', !!spk[id] && now - spk[id] < 500);
+  }
+}, 150);
+
+/* ---------- Server bilan aloqa ---------- */
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = function () {
+    if (wantInside && sessionName) tx({ type: 'join', name: sessionName });
+  };
+  ws.onmessage = function (e) {
+    if (typeof e.data !== 'string') { play(e.data); return; }
+    var m;
+    try { m = JSON.parse(e.data); } catch (err) { return; }
+    if (m.type === 'state') {
+      S = m;
+      if (!S.inside && (mic || micEnabled)) stopMic();
+      render();
+    } else if (m.type === 'join_result') {
+      if (m.ok) say('Siz gaplashish xonasidasiz.', 'ok');
+      else { wantInside = false; say(m.reason || 'Xonaga kirib bo\u02BBlmadi.', 'busy'); }
+    }
+  };
+  ws.onclose = function () {
+    stopMic();
+    S = { count: 0, maxParticipants: 10, members: [], inside: false, participantId: null };
+    render();
+    say('Server bilan aloqa uzildi. Qayta ulanmoqda...', 'busy');
+    setTimeout(connect, 1500);
+  };
+}
+connect();
+render();
+
+/* ---------- Eshitish ---------- */
+function play(packet) {
+  if (!S.inside || !ac || packet.byteLength < 4) return;
+  var id = new Uint8Array(packet, 0, 1)[0];
+  var length = (packet.byteLength - 2) >> 1;
+  if (!length) return;
+  var samples = new Int16Array(packet, 2, length);
+  var floats = new Float32Array(length);
+  for (var i = 0; i < length; i++) floats[i] = samples[i] / 32768;
+  var buffer = ac.createBuffer(1, length, OUT_RATE);
+  buffer.copyToChannel(floats, 0);
+  var source = ac.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ac.destination);
+  var now = ac.currentTime, t = nextT[id] || 0;
+  if (t < now + 0.05 || t > now + 0.7) t = now + 0.08;   // kechikish yig'ilib qolmasin
+  source.start(t);
+  nextT[id] = t + buffer.duration;
+  spk[id] = Date.now();
+}
+
+/* ---------- Mikrofon ---------- */
+function stopMic() {
+  micEnabled = false;
+  pos = 0; hang = 0;
+  if (micProcessor) { micProcessor.onaudioprocess = null; try { micProcessor.disconnect(); } catch (e) {} micProcessor = null; }
+  if (micCtx) { try { micCtx.close(); } catch (e) {} micCtx = null; }
+  if (mic) { mic.getTracks().forEach(function (t) { t.stop(); }); mic = null; }
+  render();
+}
+$('mic').onclick = async function () {
+  if (!S.inside) return;
+  if (micEnabled) { stopMic(); return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    say('Mikrofon faqat HTTPS orqali ishlaydi yoki brauzer qo\u02BBllab-quvvatlamaydi.', 'busy'); return;
+  }
+  $('mic').disabled = true;
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    if (!S.inside) { mic.getTracks().forEach(function (t) { t.stop(); }); mic = null; return; }
+    micCtx = new (window.AudioContext || window.webkitAudioContext)();
+    var source = micCtx.createMediaStreamSource(mic);
+    micProcessor = micCtx.createScriptProcessor(2048, 1, 1);
+    var silent = micCtx.createGain();
+    silent.gain.value = 0;
+    pos = 0; hang = 0;
+    micProcessor.onaudioprocess = onMicBlock;
+    source.connect(micProcessor);
+    micProcessor.connect(silent);
+    silent.connect(micCtx.destination);
+    micEnabled = true;
+    say('Mikrofon yoqildi.', 'ok');
+  } catch (error) {
+    stopMic();
+    say('Mikrofonga ruxsat berilmadi yoki mikrofon ishlamadi.', 'busy');
+  } finally {
+    $('mic').disabled = false;
+    render();
+  }
+};
+function onMicBlock(e) {
+  if (!micEnabled || !S.inside || !ws || ws.readyState !== 1 || !micCtx) return;
+  var f = e.inputBuffer.getChannelData(0), n = f.length, sum = 0, i;
+  for (i = 0; i < n; i++) sum += f[i] * f[i];
+  var now = Date.now();
+  if (Math.sqrt(sum / n) > 0.012) hang = now + 400;
+  if (now >= hang) { pos = 0; return; }          // jimlik: hech narsa yubormaymiz
+  spk[S.participantId] = now;
+  var ratio = micCtx.sampleRate / OUT_RATE, out = [];
+  while (pos < n) {
+    i = Math.floor(pos);
+    var a = f[i], b = (i + 1 < n) ? f[i + 1] : a;
+    out.push(a + (b - a) * (pos - i));
+    pos += ratio;
+  }
+  pos -= n;
+  var packet = new ArrayBuffer(2 + out.length * 2), v = new Int16Array(packet, 2);
+  for (i = 0; i < out.length; i++) { var x = Math.max(-1, Math.min(1, out[i])); v[i] = x < 0 ? x * 32768 : x * 32767; }
+  ws.send(packet);
+}
+</script>
+</body>
+</html>
